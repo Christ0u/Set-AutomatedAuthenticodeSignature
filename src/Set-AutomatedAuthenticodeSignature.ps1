@@ -125,42 +125,89 @@ PROCESS
         return
     }
 
-    while ($true)
+    # Récupération des fichiers PowerShell uniquement dont la taille est supérieure ou égale à 4 octets
+    $files = Get-ChildItem -Path $RootPath -File -Recurse | Where-Object { $_.Extension -imatch '^\.(ps1|psd1|psm1)$' -and $_.Length -ge 4 }
+
+    foreach ($file in $files)
     {
-        # Récupération des fichiers PowerShell uniquement dont la taille est supérieure ou égale à 4 octets
-
-        $files = Get-ChildItem -Path $RootPath -File -Recurse | Where-Object { $_.Extension -imatch '^\.(ps1|psd1|psm1)$' -and $_.Length -ge 4 }
-
-        foreach ($file in $files)
+        try
         {
-            try
+            # Récupération de l'état de la signature
+            $signature = Get-AuthenticodeSignature -FilePath $file.FullName -ErrorAction Stop
+        }
+        catch
+        {
+            throw "Une erreur est survenue : $($_.Exception.Message)"
+        }
+
+        # Signature du fichier PowerShell si le fichier possède une signature non valide
+        # A propos des codes de status des signatures: https://learn.microsoft.com/en-us/dotnet/api/system.management.automation.signaturestatus
+        if ( $signature.Status -ne [System.Management.Automation.SignatureStatus]::Valid)
+        {
+            Set-AuthenticodeSignature -Certificate $certificate -TimestampServer "http://timestamp.digicert.com" -FilePath $file.FullName
+        }
+    }
+
+    $fileSystemWatcher = New-Object System.IO.FileSystemWatcher
+    $fileSystemWatcher.Path = Resolve-Path -Path $RootPath | Select-Object -ExpandProperty Path
+    $fileSystemWatcher.IncludeSubdirectories = $true
+    $fileSystemWatcher.EnableRaisingEvents = $true
+    $fileSystemWatcher.NotifyFilter = [System.IO.NotifyFilters]::FileName, [System.IO.NotifyFilters]::LastWrite, [System.IO.NotifyFilters]::Size
+
+    $action = {
+        try
+        {
+            Write-Host "Événement détecté : $($Event.SourceEventArgs.FullPath)"
+
+            $file = Get-Item -Path $Event.SourceEventArgs.FullPath -ErrorAction Stop
+
+            if ($file.Extension -imatch '^\.(ps1|psd1|psm1)$' -and $file.Length -ge 4)
             {
                 # Récupération de l'état de la signature
                 $signature = Get-AuthenticodeSignature -FilePath $file.FullName -ErrorAction Stop
-            }
-            catch
-            {
-                throw "Une erreur est survenue : $($_.Exception.Message)"
-            }
 
-            # Signature du fichier PowerShell si le fichier possède une signature non valide
-            # A propos des codes de status des signatures: https://learn.microsoft.com/en-us/dotnet/api/system.management.automation.signaturestatus
-            if ( $signature.Status -ne [System.Management.Automation.SignatureStatus]::Valid)
-            {
-                Set-AuthenticodeSignature -Certificate $certificate -TimestampServer "http://timestamp.digicert.com" -FilePath $file.FullName
+                # Signature du fichier PowerShell si le fichier possède une signature non valide
+                # A propos des codes de status des signatures: https://learn.microsoft.com/en-us/dotnet/api/system.management.automation.signaturestatus
+                if ( $signature.Status -ne [System.Management.Automation.SignatureStatus]::Valid)
+                {
+                    Set-AuthenticodeSignature -Certificate $Event.MessageData -TimestampServer "http://timestamp.digicert.com" -FilePath $file.FullName
+                }
             }
         }
-
-        # Pause
-        Start-Sleep -Seconds 5
+        catch
+        {
+            Write-Error "Impossible de signer le fichier '$($Event.SourceEventArgs.FullPath)' : $($_.Exception.Message)"
+        }
     }
+
+    Register-ObjectEvent -InputObject $fileSystemWatcher -EventName Changed -Action $action -SourceIdentifier 'PowerShellFileChanged' -MessageData $certificate
+
+    try
+    {
+        while ($true)
+        {
+            # Suspend l'exécution du script jusqu'à ce qu'un évènement soit déclenché
+            Wait-Event -SourceIdentifier 'PowerShellFileChanged' -ErrorAction Stop | Out-Null
+        }
+    }
+    catch
+    {
+        Write-Error "Une exception est survenue : $($_.Exception.Message)"
+    }
+    finally
+    {
+        Unregister-Event -SourceIdentifier 'PowerShellFileChanged' -ErrorAction SilentlyContinue
+
+        $fileSystemWatcher.Dispose()
+    }
+
 }
 
 # SIG # Begin signature block
 # MIIcKAYJKoZIhvcNAQcCoIIcGTCCHBUCAQExCzAJBgUrDgMCGgUAMGkGCisGAQQB
 # gjcCAQSgWzBZMDQGCisGAQQBgjcCAR4wJgIDAQAABBAfzDtgWUsITrck0sYpfvNR
-# AgEAAgEAAgEAAgEAAgEAMCEwCQYFKw4DAhoFAAQUh970xxMI7uJT453ZMAwcIgWx
-# YjOgghZ8MIIDPjCCAiagAwIBAgIQWSl0Rdk7IZ5AP4ehb0/ksDANBgkqhkiG9w0B
+# AgEAAgEAAgEAAgEAAgEAMCEwCQYFKw4DAhoFAAQUgdaxSDsT6QcjqI/SMwdSByw5
+# giugghZ8MIIDPjCCAiagAwIBAgIQWSl0Rdk7IZ5AP4ehb0/ksDANBgkqhkiG9w0B
 # AQsFADA3MTUwMwYDVQQDDCxDaHJpc3RvcGhlciBHRVJBUkQgLSBQb3dlclNoZWxs
 # IENvZGUgU2lnbmluZzAeFw0yNjExMDcwMDUxNDJaFw0zNjExMDcwMTAxNDJaMDcx
 # NTAzBgNVBAMMLENocmlzdG9waGVyIEdFUkFSRCAtIFBvd2VyU2hlbGwgQ29kZSBT
@@ -284,28 +331,28 @@ PROCESS
 # IFBvd2VyU2hlbGwgQ29kZSBTaWduaW5nAhBZKXRF2TshnkA/h6FvT+SwMAkGBSsO
 # AwIaBQCgeDAYBgorBgEEAYI3AgEMMQowCKACgAChAoAAMBkGCSqGSIb3DQEJAzEM
 # BgorBgEEAYI3AgEEMBwGCisGAQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMCMGCSqG
-# SIb3DQEJBDEWBBTkPFNRvj3CsJW606zvkaVEzncfPzANBgkqhkiG9w0BAQEFAASC
-# AQAjN1gXtsDidUlS9R2VLCRwevioJzMrxMRQ+KxXO6iKum0iJor5XsM6uZJpV6UX
-# dtQu9xJ7zvnPqbgRYf6TdHq2jDQpGhXqyu9PH0VJCH+NykWJ8aJB9utlDdGnjMbv
-# mnP4akHICCUXGgVSypghicGBuH3wFf9DqwrMQGGYTMfDUnYaDdyHFYBckU/MQsWh
-# FVeKUCZsI77DklU3jRhZIMxKIfr31O/2gkwFgPO2jZu40StOhgkag3XmXe5JzuXo
-# MubWUiES516hrqJ3rIs0SqOrBnrtdbOGYDXThVD2CHAoV7QqVydvl50Mxd5QM3na
-# wNSX3Gl8H1H6sFglHKSKPQwUoYIDJjCCAyIGCSqGSIb3DQEJBjGCAxMwggMPAgEB
+# SIb3DQEJBDEWBBR3CX2IMOz6qj/kooE7jb+5nwmVxzANBgkqhkiG9w0BAQEFAASC
+# AQA2LG/T1mPX1o80XtzTwGXiBn/yTPBHj3FbrZ5oZsWEqK8rBLWu/Q+HK9DtXnv7
+# jKlvuJJQs4vuaiGAYsD8NWT2iNQE+DCntRF6VbgO6Ty02LtYxKkaYs9799ce0yVz
+# KaiF7fBgxDyqjCfcZ+DkWtBvkkA0C3gSiBuNcuQTSQFaWF1ABOgxCO3RT138YWhq
+# cEjYMTtk3+OG0GyVytaYVd9H6lINUjRBtQrMsNw8KFUzhYPL4GyUMy0gkJgVM8sn
+# vyJysLM3nXzLMMibfZ1e3/7EzIqyaZsAE26vWwWk6g81Pfg9osSQSGJkdsCN0JsF
+# HrrDCBc5R5HP/Fp2UHx+vZP2oYIDJjCCAyIGCSqGSIb3DQEJBjGCAxMwggMPAgEB
 # MH0waTELMAkGA1UEBhMCVVMxFzAVBgNVBAoTDkRpZ2lDZXJ0LCBJbmMuMUEwPwYD
 # VQQDEzhEaWdpQ2VydCBUcnVzdGVkIEc0IFRpbWVTdGFtcGluZyBSU0E0MDk2IFNI
 # QTI1NiAyMDI1IENBMQIQCE/cM09+RU7bww+P+ZIYNTANBglghkgBZQMEAgEFAKBp
 # MBgGCSqGSIb3DQEJAzELBgkqhkiG9w0BBwEwHAYJKoZIhvcNAQkFMQ8XDTI2MTEw
-# NzAxMDU0MlowLwYJKoZIhvcNAQkEMSIEIGZd1q6+8KJRxkzYOWhD4D05n7OE8iWK
-# OHq0V72ZZ3orMA0GCSqGSIb3DQEBAQUABIICAC7QyuGzKCsvRO+uqRPYnxJJP1RF
-# etPpd74+PhZuQMYY/WY+MSRs+eih5HrYpGYWfrVf5Iu++/H7wNeibtFeSTQXTzZ6
-# nkb2SLG4sP0h1zn74YUM4Vw6ZZknW1r6MmaxGj73i3SIpX5VDL5bghlQd1qheuBk
-# U9QVrq7m0TIcrxyX12ToRtx8CQf76OzkGdjQxXIdaxpx+rOnlwlc++1WthVYsPYS
-# V4nXD/7wxWY3ZNRtVnamnrbRbwXTt+yu4DsKOvZihKbq0BfvoJSV8wAboIn7dX+L
-# 2FE7M1MSYx759xm5Q0ks0qnC3WwGv5XlOfkN/X+sH6UUTetKSlYypJ+kP2V5AWeI
-# i78J3gWVS3vnbvCPrH+A/NJrCF9jxaCmASTMYEYdAFq4+BVpjIyOIFuMtxIOWCsN
-# Jb+7i/u4pU5fKM1jbcW1ablpkA183TXhO/RjR0QabfOSLe+LQgZZsiMq+vGeftJW
-# 9gr0YF0MokpsI44H4mqSwH6do0wvGYgqzg600H8wR5pVfut7AOeOGDyCd1XhY76s
-# 10tC1mxvUBPQMJnL7UnD8Loht+IvKWf5vNUIWEVXPGmjlXJQ7C8YJfkIQzHVylJM
-# utH6HNeP5pL1eH4NjzuPb3648KnQPTQgOUAgmmrZvWfUJkFQhV4mcF/zY/oZtkEQ
-# 22OcmeBrAI2UijUp
+# NzAyMDYyN1owLwYJKoZIhvcNAQkEMSIEIGhfEkMZgDmzjRwGJGtcw0CSy0f50X45
+# Lzswbt7PWBPOMA0GCSqGSIb3DQEBAQUABIICAI47S4DNKZgGqSqYmVOxxnN4JYVD
+# 91vhypn8La3/gMciBQsGvfnIsOVJUfx6YHbS7T/YgY6VGtdFhzkqM1rKA1ONqb19
+# B1vDvkt3CG7LhpXmPpzmuY+MRqqFoiYi8KXjWWXvmARmFIeOW/qT64Xg06YsnWhb
+# c9Fs+Xpy4Upd+9wDtZoV+VNi1OKUA3Fg2nSAMGtAbyWJb4JvzM8ErA8VM7cgqrBX
+# McU+laRWoikA1CdnGuR6gkC/rAYjyPMwgPK6gISbkvYUx7V1sUFE5jifIEVHIx1G
+# LPDOAZF27sxv09y4BNf7qIJE6IW3uDj7gwTrzmKdrb/4Csm/41HEEH6hqnPi803D
+# dmEL8nqpBSihIQUYcchRHRizKX+SrbXfIyb+DpegVK/vtLRdbKbujQr/RGw7H2gG
+# ZW9/y40xjaaJ1HxLYLZUeK17f8cPvI3xfU3ftonlDZ5Umqu1jKUDJ8f3dVXzpdN/
+# FZCjLuozM22KMCXrG19ELiwI9CMa8mUADA3F6Xb+JBB8MU02+UMYnardLeYq2BeS
+# lmzQfvKAOQjq2YdqQDNnGklOsXc6i5LaIOPMumetCC7iFYbFbUf2lup2t5Vn/Kkj
+# DAty/oICOwk4SZfQ4O8MAyeA0x9uDBJIRESSme7C4KRh8WX8JSIDs2BHAXU0fO8N
+# Ysdv8Mmq6JSfnajn
 # SIG # End signature block
