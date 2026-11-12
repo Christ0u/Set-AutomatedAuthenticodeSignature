@@ -100,7 +100,7 @@ E7DAC6FBC64F03BC009299DE5A46F57901010958  Valid                                 
 [cmdletbinding()]
 Param(
     # Root directory to monitor for PowerShell files.
-    [Parameter(Mandatory = $false, ValueFromPipeline = $true, HelpMessage = "Specifies the path to a directory or file that defines the scope of the signature verification.")]
+    [Parameter(ValueFromPipeline = $true, HelpMessage = "Specifies the path to a directory or file that defines the scope of the signature verification.")]
     [ValidateScript({
             Test-Path -Path $_ -IsValid
         })]
@@ -111,7 +111,13 @@ Param(
     [Parameter(Mandatory = $true, HelpMessage = "Specifies the thumbprint of the code-signing certificate.")]
     [ValidateNotNullOrEmpty()]
     [string]
-    $CertificateThumbprint
+    $CertificateThumbprint,
+
+    # File extensions to monitor and sign.
+    [Parameter(Mandatory = $true, HelpMessage = "Specifies the file extensions to monitor and sign.")]
+    [ValidateNotNullOrEmpty()]
+    [string[]]
+    $FileExtensions
 )
 
 PROCESS
@@ -127,8 +133,25 @@ PROCESS
         return
     }
 
-    # Get all PowerShell files that are at least 4 bytes long.
-    $files = Get-ChildItem -Path $RootPath -File -Recurse | Where-Object { $_.Extension -imatch '^\.(ps1|psd1|psm1)$' -and $_.Length -ge 4 }
+    # Normalize file extensions: trim spaces and dots, convert to lowercase, and remove duplicates.
+    $FileExtensions = [array]($FileExtensions | ForEach-Object { $_.Trim(' ', '.').ToLower() } | Select-Object -Unique)
+
+    if ($FileExtensions.Count -eq 0)
+    {
+        Write-Error "At least one file extension must be specified."
+
+        return
+    }
+
+    # Build a regular expression that matches any of the normalized file extensions, for example: '^\.(ps1|psd1|psm1)$'.
+    $fileExtensionPattern = "^\."
+    $fileExtensionPattern = "$($fileExtensionPattern)($($FileExtensions -join '|')"
+    $fileExtensionPattern = "$($fileExtensionPattern))$"
+
+    # Get all files matching the configured extensions and at least 4 bytes long.
+    $files = Get-ChildItem -Path $RootPath -File -Recurse | Where-Object {
+        $_.Extension -imatch $fileExtensionPattern -and $_.Length -ge 4
+    }
 
     # Check and sign every existing PowerShell file before starting the file watcher.
     foreach ($file in $files)
@@ -191,8 +214,8 @@ PROCESS
             # Get the file that triggered the event.
             $file = Get-Item -LiteralPath $path -ErrorAction Stop
 
-            # Process only PowerShell files that are at least 4 bytes long.
-            if ($file.Extension -imatch '^\.(ps1|psd1|psm1)$' -and
+            # Process all files matching the configured extensions and at least 4 bytes long.
+            if ($file.Extension -imatch $fileExtensionPattern -and
                 $file.Length -ge 4)
             {
                 # Wait until the file stops changing, because an editor such as
@@ -233,7 +256,7 @@ PROCESS
         catch
         {
             # Report the error without stopping the file watcher.
-            Write-Warning "Impossible de signer le fichier '$($Event.SourceEventArgs.FullPath)' : $($_.Exception.Message)"
+            Write-Warning "Unable to sign file '$($Event.SourceEventArgs.FullPath)' : $($_.Exception.Message)"
         }
     }
 
@@ -266,8 +289,8 @@ PROCESS
 # SIG # Begin signature block
 # MIIcKAYJKoZIhvcNAQcCoIIcGTCCHBUCAQExCzAJBgUrDgMCGgUAMGkGCisGAQQB
 # gjcCAQSgWzBZMDQGCisGAQQBgjcCAR4wJgIDAQAABBAfzDtgWUsITrck0sYpfvNR
-# AgEAAgEAAgEAAgEAAgEAMCEwCQYFKw4DAhoFAAQUjMRtyEVv8iaQIoGE/Zgpylem
-# WKGgghZ8MIIDPjCCAiagAwIBAgIQWSl0Rdk7IZ5AP4ehb0/ksDANBgkqhkiG9w0B
+# AgEAAgEAAgEAAgEAAgEAMCEwCQYFKw4DAhoFAAQUfvPs1IvyH+L766B5Q7LivMuA
+# 3hugghZ8MIIDPjCCAiagAwIBAgIQWSl0Rdk7IZ5AP4ehb0/ksDANBgkqhkiG9w0B
 # AQsFADA3MTUwMwYDVQQDDCxDaHJpc3RvcGhlciBHRVJBUkQgLSBQb3dlclNoZWxs
 # IENvZGUgU2lnbmluZzAeFw0yNjExMDcwMDUxNDJaFw0zNjExMDcwMTAxNDJaMDcx
 # NTAzBgNVBAMMLENocmlzdG9waGVyIEdFUkFSRCAtIFBvd2VyU2hlbGwgQ29kZSBT
@@ -391,28 +414,28 @@ PROCESS
 # IFBvd2VyU2hlbGwgQ29kZSBTaWduaW5nAhBZKXRF2TshnkA/h6FvT+SwMAkGBSsO
 # AwIaBQCgeDAYBgorBgEEAYI3AgEMMQowCKACgAChAoAAMBkGCSqGSIb3DQEJAzEM
 # BgorBgEEAYI3AgEEMBwGCisGAQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMCMGCSqG
-# SIb3DQEJBDEWBBQq+dF0Ps4JYSaw3KYUDEVgUvVcYTANBgkqhkiG9w0BAQEFAASC
-# AQCzsz6zKZeEv/jeZOW0ujarn6Tbud6QJoc/K4+zuqx1RHzNwwsOqe3DnzDCu3dc
-# Ei35+8hhDEAriW7p5eKXEvzLxFlZwiAKWOQP34R1eyKw68KcxmGXwO0zeeHqz+89
-# g998rpnx8nWLSpebH1elOVNx97MCRIw8mi0Qt1XEgl3g82SInRg1vNKlUehii/9M
-# mfOOFoe/G9Nvbgv3KrtiqDhi7FyGNsGUsthW8aluY25gxJf9yluR8GBWw6Kp5xsP
-# Hu0ZSBmOGU+Yc/RKi64AyL6ax+W/+uQDt5879hMb3oZNwmUkrueKfRDFl6BqBXjB
-# /t/hBs2StU1GVFV5NA3C5RinoYIDJjCCAyIGCSqGSIb3DQEJBjGCAxMwggMPAgEB
+# SIb3DQEJBDEWBBSE3YtYtfuNEdzHy+1EI40lNHCSbTANBgkqhkiG9w0BAQEFAASC
+# AQA6xtbWSMz/g3JYr7uIXubLctsAVZ9gs63MGyDeCLiioXy6YSqNoiZnPC1a5ge0
+# VJ2Wen7qqDMa6ZPkvonaEBToSpeJ7XGFHt3MlbscmYzeTg60U02I7/q7Ogp5DYQ3
+# f54NWKXYzJMQ6aCRIpU2+4kE5RnljMjyNUhs3lZ2y7cE3D/Wx3t5AI8iO5rAivp2
+# AVaOZCL/ugYzqhYDRaY/XwgAwc4vQ9kE2Ys5DDuSID/HpSYgzG9ckkSylAjdBatX
+# e2XLE+GjyhmzJd5ibB4SKgocgktlFPD8SdzRLoETdlvd9S8ugyhGM2DBbtcDoi4D
+# yuuTzTyDShg6iq+8Sxfonse6oYIDJjCCAyIGCSqGSIb3DQEJBjGCAxMwggMPAgEB
 # MH0waTELMAkGA1UEBhMCVVMxFzAVBgNVBAoTDkRpZ2lDZXJ0LCBJbmMuMUEwPwYD
 # VQQDEzhEaWdpQ2VydCBUcnVzdGVkIEc0IFRpbWVTdGFtcGluZyBSU0E0MDk2IFNI
 # QTI1NiAyMDI1IENBMQIQCE/cM09+RU7bww+P+ZIYNTANBglghkgBZQMEAgEFAKBp
 # MBgGCSqGSIb3DQEJAzELBgkqhkiG9w0BBwEwHAYJKoZIhvcNAQkFMQ8XDTI2MTEx
-# MjE5MjU0MlowLwYJKoZIhvcNAQkEMSIEIK3hPkxfYLE6d9EkwFPl9zyOxuq6ekHD
-# MwrKwZLyISn9MA0GCSqGSIb3DQEBAQUABIICAF+DX6Hfo75l0irUW+ZgtRVpDEJl
-# aimZD6nNBISSb9Hnw5C4U2ahHiJg3CKtAK7WfGXcm9qKWpzLtd9FRwB7/+TbesIj
-# bF5snFO76dULJhDiVlnaqeWmM40Ta9wpUs0E2j4cMf2e/l+0JoZbNcibBydcYnXp
-# doRZUwz8q2tk4wVd5Iz5LZuKDx61t42juaXxLxyHFxFBK2XppruV2l7QdnfYqiRT
-# Mh467mKGIdSfc7AOd82kd5qVKlKtVh5xYJ3gRqi9svHFGBnA6xBdnRm5q4oXCZOq
-# Xc29GVIAqtvJoyJVVUVznVYCjngts/OcsNpAIUSUhsIyUgN4o0j7AiRIQoDiv+Jm
-# K+TfXMuacgt6SQUiMEp9r2+8mjWAA/iV4vSo4eKJg1mRLB9f1A7FCz7LASLQCQLB
-# ZYezG/JNTYd14hptKNJINi/2AzwzWp2kwLcKjch927zALhtuM6tIAgGakWZuk0RE
-# p6bjwb8n62NbHzRK8zfE1mTxjMkDfe+zo/1b2cvFlKi8e9mimVWj1Ge+PuPB/ZEv
-# mBzEM3hyssPtcqiLrbkO+YqzJRw4NqZp/0Bcqc9Ya5BV3LxOqJ4mbxk7o4OFr3Hp
-# 8IoDLbR0haESYJyPpzoVdy5OVBMaxdQfgDlext/F4sqrcZPSLU6kwH8Zy6FNAiwj
-# dzaXQlowsd83tX2K
+# MjIwNTIzNFowLwYJKoZIhvcNAQkEMSIEIPIDYkeAhieilvqH6SlIVD0/KgquXB81
+# y8hMBrxMcevfMA0GCSqGSIb3DQEBAQUABIICAIHI8kjpt+tnOowHASOsIw4qPLvL
+# gKz2HmnVER0xz5ylHzcMPrryCv7VK9ZkQ7YVBRQe/gGB2x35g7c8QsBV0RGTLxD3
+# pn0QM1j8JLViarOxcaYx/XdyAP4cEn2HP+1/E8XzLndLFnlp7snA2rUaF+TCtN19
+# HvhWe9lY9qdBGW6igTOVfbEMDsn6q62WJWk1gjN6LkNnc0PEuetC9xjouYJrlczp
+# mHWPPmL1NqfDoTCfnF+CvG7uhWasU7MZa599aiAHEFgOw4GTia+MvNuApN4LFxoK
+# eG+8Y/r9t3/cqy41RjWtCOIcagyDPztK2abM2uNcWy+AWV1UG29LMGMy1jnsAzG5
+# heypWVLy7fwd83OOsjFC2T5eza804R5IRxhwopFYBwOxKdXpuDa1R6A04L/2C947
+# J5cCLgojRfYdTQAyAm5iSpONZEFC2e1uagb4icXqJVZYX/DUpVV71sZGRAd/JA2p
+# pnr3RasXsAej7o/wHfNQngH4Fn4/j35zLG67KuAPSlMGAjjiRhb0Yz2HYFgLQggp
+# iMlo+7XkZy1TinlsG+AMRw5P9lB8C4Eg9LhFdj1AAMlWD/peV/jBQ/1J7SeIR+k+
+# pZ9IYMml9APBw6FbW6mVxzRVD1vxOdktn4BrvI5Zt4qrdszr8IpqeFL1sIe7Yf8g
+# fl0xHAeaV+IAcB/i
 # SIG # End signature block
