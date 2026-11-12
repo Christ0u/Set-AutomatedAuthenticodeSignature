@@ -8,9 +8,9 @@
 
 .COMPANYNAME
 
-.COPYRIGHT Copyright 2024 Christopher GERARD
+.COPYRIGHT Copyright 2024-2026 Christopher GERARD
 
-.TAGS
+.TAGS PowerShell Authenticode CodeSigning Signature FileSystemWatcher Automation Windows
 
 .LICENSEURI
 
@@ -25,7 +25,9 @@
 .EXTERNALSCRIPTDEPENDENCIES
 
 .RELEASENOTES
-
+ Initial release.
+ Automatically signs PowerShell files with an Authenticode code-signing certificate.
+ Monitors a directory and its subdirectories, then re-signs modified files.
 
 .PRIVATEDATA
 
@@ -34,67 +36,55 @@
 <#
 
 .SYNOPSIS
- Script PowerShell permettant la signature automatique de scripts PowerShell.
+ Automatically signs PowerShell files using Authenticode signatures.
 
 .DESCRIPTION
- Script PowerShell permettant la signature automatique de scripts PowerShell.
+ This script signs PowerShell files with a code-signing certificate.
+ It can sign existing files before starting, then monitor the specified directory and its subdirectories to automatically re-sign files after they are modified.
 
 .PARAMETER RootPath
- Spécifie un chemin d'accès vers un répertoire ou un fichier définissant l'étendue de la vérification des signatures.
+ Specifies the path to the root directory to monitor and sign.
+ This parameter is optional.
+ The default value is '%HOMEDRIVE%%HOMEPATH%\Documents\WindowsPowerShell\Sources'.
 
-.PARAMETER Certificate
- Spécifie le certificat avec lequel les scripts doivent être signés.
+.PARAMETER CertificateThumbprint
+ Specifies the thumbprint of the code-signing certificate to use.
+ This parameter is mandatory.
 
-.EXAMPLE
- PS> $cert = (Get-ChildItem -Path Cert:\CurrentUser\My\E7DAC6FBC64F03BC009299DE5A46F57901010958)
- PS> .\Set-AutomatedAuthenticodeSignature.ps1 -RootPath C:\Users\christopher.gerard\Documents\WindowsPowerShell\Sources\Scripts\Set-AutomatedAuthenticodeSignature\src\Set-AutomatedAuthenticodeSignature.ps1 -Certificate $cert
-
-    Répertoire : C:\Users\christopher.gerard\Documents\WindowsPowerShell\Sources\Scripts\Set-AutomatedAuthenticodeSignature\src
-
-SignerCertificate                         Status                                                    Path
------------------                         ------                                                    ----
-E7DAC6FBC64F03BC009299DE5A46F57901010958  Valid                                                     Set-AutomatedAuthenticodeSignature.ps1
-
- Cette commande permet la signature d'un script PowerShell spécifique si celui-ci n'a pas déjà une signature valide.
+.PARAMETER FileExtensions
+ Specifies the file extensions to monitor and sign.
+ This parameter is mandatory.
+ Extensions can be provided with or without a leading dot, for example: '.ps1', 'psd1', or '.PSM1'.
 
 .EXAMPLE
- PS> $cert = (Get-ChildItem -Path Cert:\CurrentUser\My\E7DAC6FBC64F03BC009299DE5A46F57901010958)
- PS> "C:\Users\christopher.gerard\Documents\WindowsPowerShell\Sources\" | .\Set-AutomatedAuthenticodeSignature.ps1 -Certificate $cert
+ PS> .\Set-AutomatedAuthenticodeSignature.ps1 -CertificateThumbprint "E7DAC6FBC64F03BC009299DE5A46F57901010958" -FileExtensions ".ps1", ".psd1", ".psm1"
 
-    Répertoire : C:\Users\christopher.gerard\Documents\WindowsPowerShell\Sources\Scripts\Set-AutomatedAuthenticodeSignature\src
+ Signs and monitors PowerShell files in the default root directory.
 
-SignerCertificate                         Status                                                    Path
------------------                         ------                                                    ----
-E7DAC6FBC64F03BC009299DE5A46F57901010958  Valid                                                     Set-AutomatedAuthenticodeSignature.ps1
+ .EXAMPLE
+ PS> .\Set-AutomatedAuthenticodeSignature.ps1 -RootPath "$($env:HOMEDRIVE)$($env:HOMEPATH)\Sources" -CertificateThumbprint "E7DAC6FBC64F03BC009299DE5A46F57901010958" -FileExtensions ".ps1", ".psd1", ".psm1"
 
- Cette commande permet la signature de scripts PowerShell à l'emplacement spécifié, à travers un pipeline, si ceux-ci n'ont pas déjà une signature valide.
+ Signs and monitors PowerShell files in the specified directory.
 
-.EXAMPLE
- PS> $cert = Get-ChildItem -Path Cert:\CurrentUser\My -CodeSigningCert | Where-Object{ $_.Issuer -imatch "CEA SubCA 1" }
- PS> .\Set-AutomatedAuthenticodeSignature.ps1 -Certificate $cert
+ .EXAMPLE
+ "$($env:HOMEDRIVE)$($env:HOMEPATH)\Sources" | .\src\Set-AutomatedAuthenticodeSignature.ps1 -CertificateThumbprint "fe4ad9cad2a6e1ff9e8566a3c406b64d7e173a2b" -FileExtensions ".ps1", ".psd1", ".psm1"
 
-    Répertoire : C:\Users\christopher.gerard\Documents\WindowsPowerShell\Sources\Scripts\Set-AutomatedAuthenticodeSignature\src
+ Signs and monitors PowerShell files in the directory received through the pipeline.
 
-SignerCertificate                         Status                                                    Path
------------------                         ------                                                    ----
-E7DAC6FBC64F03BC009299DE5A46F57901010958  Valid                                                     Set-AutomatedAuthenticodeSignature.ps1
-
- Cette commande permet la signature de scripts PowerShell à l'emplacement par défaut '%HOMEDRIVE%%HOMEPATH%\Documents\WindowsPowerShell\Sources' si ceux-ci n'ont pas déjà une signature valide.
-
-.INPUTS
+ .INPUTS
  System.String
 
- Vous pouvez rediriger une chaîne contenant le chemin d'accès vers le répertoire ou le fichier définissant l'étendue de la vérification des signatures.
+ You can pipe a string containing the path to the root directory to monitor and sign.
 
 .OUTPUTS
- System.Management.Automation.Signature
+ None
 
- Cette applet de commande renvoie un objet Signature représentant la valeur qu'elle a définie.
+ This script does not return any output.
 
 .LINK
  https://learn.microsoft.com/en-us/dotnet/api/system.management.automation.signaturestatus
 
- Documentation détaillant les codes de status des signatures d'un fichier.
+ Documentation describing the signature status values of a file.
 #>
 
 [cmdletbinding()]
@@ -289,8 +279,8 @@ PROCESS
 # SIG # Begin signature block
 # MIIcKAYJKoZIhvcNAQcCoIIcGTCCHBUCAQExCzAJBgUrDgMCGgUAMGkGCisGAQQB
 # gjcCAQSgWzBZMDQGCisGAQQBgjcCAR4wJgIDAQAABBAfzDtgWUsITrck0sYpfvNR
-# AgEAAgEAAgEAAgEAAgEAMCEwCQYFKw4DAhoFAAQUfvPs1IvyH+L766B5Q7LivMuA
-# 3hugghZ8MIIDPjCCAiagAwIBAgIQWSl0Rdk7IZ5AP4ehb0/ksDANBgkqhkiG9w0B
+# AgEAAgEAAgEAAgEAAgEAMCEwCQYFKw4DAhoFAAQUOqmR946Crm2SoKQy8AwRU0M1
+# UIugghZ8MIIDPjCCAiagAwIBAgIQWSl0Rdk7IZ5AP4ehb0/ksDANBgkqhkiG9w0B
 # AQsFADA3MTUwMwYDVQQDDCxDaHJpc3RvcGhlciBHRVJBUkQgLSBQb3dlclNoZWxs
 # IENvZGUgU2lnbmluZzAeFw0yNjExMDcwMDUxNDJaFw0zNjExMDcwMTAxNDJaMDcx
 # NTAzBgNVBAMMLENocmlzdG9waGVyIEdFUkFSRCAtIFBvd2VyU2hlbGwgQ29kZSBT
@@ -414,28 +404,28 @@ PROCESS
 # IFBvd2VyU2hlbGwgQ29kZSBTaWduaW5nAhBZKXRF2TshnkA/h6FvT+SwMAkGBSsO
 # AwIaBQCgeDAYBgorBgEEAYI3AgEMMQowCKACgAChAoAAMBkGCSqGSIb3DQEJAzEM
 # BgorBgEEAYI3AgEEMBwGCisGAQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMCMGCSqG
-# SIb3DQEJBDEWBBSE3YtYtfuNEdzHy+1EI40lNHCSbTANBgkqhkiG9w0BAQEFAASC
-# AQA6xtbWSMz/g3JYr7uIXubLctsAVZ9gs63MGyDeCLiioXy6YSqNoiZnPC1a5ge0
-# VJ2Wen7qqDMa6ZPkvonaEBToSpeJ7XGFHt3MlbscmYzeTg60U02I7/q7Ogp5DYQ3
-# f54NWKXYzJMQ6aCRIpU2+4kE5RnljMjyNUhs3lZ2y7cE3D/Wx3t5AI8iO5rAivp2
-# AVaOZCL/ugYzqhYDRaY/XwgAwc4vQ9kE2Ys5DDuSID/HpSYgzG9ckkSylAjdBatX
-# e2XLE+GjyhmzJd5ibB4SKgocgktlFPD8SdzRLoETdlvd9S8ugyhGM2DBbtcDoi4D
-# yuuTzTyDShg6iq+8Sxfonse6oYIDJjCCAyIGCSqGSIb3DQEJBjGCAxMwggMPAgEB
+# SIb3DQEJBDEWBBRpPaHTSk264T4v+NHnw0K1urSJWTANBgkqhkiG9w0BAQEFAASC
+# AQCkuimGC5FrPTGqeng96YzUblMQ7HdaAbGBjBdUKuw2JNfq1wG78jrrlmb+KmiQ
+# UWFiC65McXwCxL1P0Rwez3YfLIcq8xxE62+2kFExgYfkztaZqku4lnlQf+QzqH9g
+# mmkrcSw0jrPCsN0HOaiuZXuNoh5emE3hKwZemvU4WaZI4Ku5sN1cCoYc/aJXLcGo
+# zF0fxYXUsuJZgI4pzfAVSQwW2/TZ7XWWIl8KS4LhZwFBPihtyXu9zKJsbFZCBzDq
+# jS1s7cZa+oBUnZE+HGymtcZmzEl9XWhEY2muSFI6VYnYrEXX0XvEhemMnlh0jUAs
+# ZSZQ45tq9Ql8aL1LFnP69QZfoYIDJjCCAyIGCSqGSIb3DQEJBjGCAxMwggMPAgEB
 # MH0waTELMAkGA1UEBhMCVVMxFzAVBgNVBAoTDkRpZ2lDZXJ0LCBJbmMuMUEwPwYD
 # VQQDEzhEaWdpQ2VydCBUcnVzdGVkIEc0IFRpbWVTdGFtcGluZyBSU0E0MDk2IFNI
 # QTI1NiAyMDI1IENBMQIQCE/cM09+RU7bww+P+ZIYNTANBglghkgBZQMEAgEFAKBp
 # MBgGCSqGSIb3DQEJAzELBgkqhkiG9w0BBwEwHAYJKoZIhvcNAQkFMQ8XDTI2MTEx
-# MjIwNTIzNFowLwYJKoZIhvcNAQkEMSIEIPIDYkeAhieilvqH6SlIVD0/KgquXB81
-# y8hMBrxMcevfMA0GCSqGSIb3DQEBAQUABIICAIHI8kjpt+tnOowHASOsIw4qPLvL
-# gKz2HmnVER0xz5ylHzcMPrryCv7VK9ZkQ7YVBRQe/gGB2x35g7c8QsBV0RGTLxD3
-# pn0QM1j8JLViarOxcaYx/XdyAP4cEn2HP+1/E8XzLndLFnlp7snA2rUaF+TCtN19
-# HvhWe9lY9qdBGW6igTOVfbEMDsn6q62WJWk1gjN6LkNnc0PEuetC9xjouYJrlczp
-# mHWPPmL1NqfDoTCfnF+CvG7uhWasU7MZa599aiAHEFgOw4GTia+MvNuApN4LFxoK
-# eG+8Y/r9t3/cqy41RjWtCOIcagyDPztK2abM2uNcWy+AWV1UG29LMGMy1jnsAzG5
-# heypWVLy7fwd83OOsjFC2T5eza804R5IRxhwopFYBwOxKdXpuDa1R6A04L/2C947
-# J5cCLgojRfYdTQAyAm5iSpONZEFC2e1uagb4icXqJVZYX/DUpVV71sZGRAd/JA2p
-# pnr3RasXsAej7o/wHfNQngH4Fn4/j35zLG67KuAPSlMGAjjiRhb0Yz2HYFgLQggp
-# iMlo+7XkZy1TinlsG+AMRw5P9lB8C4Eg9LhFdj1AAMlWD/peV/jBQ/1J7SeIR+k+
-# pZ9IYMml9APBw6FbW6mVxzRVD1vxOdktn4BrvI5Zt4qrdszr8IpqeFL1sIe7Yf8g
-# fl0xHAeaV+IAcB/i
+# MjIwNTM0NVowLwYJKoZIhvcNAQkEMSIEILuQzTWCwqROeNHo54iJ7mZbTzuTmhDG
+# N6I58hUSMGWIMA0GCSqGSIb3DQEBAQUABIICACYAWwRpe/2hyvLkjCHM+on6Ikpd
+# OY5cpXXtvKldrPq9dm0ozGA5lvmzpTRH3cJulUvooZD9SfxZY7SbE17C07gZQCEs
+# M0In04egku2/ibUUZzy69RPgyrldMUXjfBgJoeM7bymGKr/d6BqyQEV0ZXw9ZZlT
+# jCc01+mqlHTsdayAwTOtVjo98iiGQnnvykzOWkIqM4/0eDUxluSRNoE6vwSOuylr
+# Gx5ygucqSOHaRuX4D9dHXfwtYhep2Sq8a5buOKKJzbES/iovm+oVRfn1AUpo0/rX
+# 631kWUX/SoXypryzw90V7H2vl76iPwPrHWKY9cS2aPR5iY5jQ3peyWmkgWFkzW+3
+# 5N5pNGa5bEohhJFk8T15K62rvv84KP63KlPjpapnZl2ytyj3I/Ql1hZKGz6RDNhv
+# lfFBkomX7FfZvLOVl+TbNHR1DqSyJW9S4SoAelsMqG0Su5ptuO9MZbv/WzrwRi+6
+# 7fmdsJQd3349POsUanPEmUtzEIaXSMfAH5WDSvwiAxRLvKvVs1sUANzdz3rDrbCa
+# cxS2GNY2YoqX6z4iiAf3N8EhfQvzANOfVVVFYOyNz1f1XpcAfdz8HiDIRU917FXF
+# NkW1aP8oMVt46zHf1zyh3A5J3GmY3ahwvxAgvDryVGiH0ZyUZvQY0ktBU4W/ZByf
+# +TpJn3+WdwA/Ejbr
 # SIG # End signature block
