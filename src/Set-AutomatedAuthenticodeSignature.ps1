@@ -99,16 +99,16 @@ E7DAC6FBC64F03BC009299DE5A46F57901010958  Valid                                 
 
 [cmdletbinding()]
 Param(
-    # Répertoire racine
-    [Parameter(Mandatory = $false, ValueFromPipeline = $true, HelpMessage = "Spécifie un chemin d'accès vers un répertoire ou un fichier définissant l'étendue de la vérification des signatures")]
+    # Root directory to monitor for PowerShell files.
+    [Parameter(Mandatory = $false, ValueFromPipeline = $true, HelpMessage = "Specifies the path to a directory or file that defines the scope of the signature verification.")]
     [ValidateScript({
             Test-Path -Path $_ -IsValid
         })]
     [string]
     $RootPath = "$($env:HOMEDRIVE)$($env:HOMEPATH)\Documents\WindowsPowerShell\Sources",
 
-    # Certificat de signature
-    [Parameter(Mandatory = $true, HelpMessage = "Spécifie l'empreinte du certificat de signature de code")]
+    # Thumbprint of the code-signing certificate to use.
+    [Parameter(Mandatory = $true, HelpMessage = "Specifies the thumbprint of the code-signing certificate.")]
     [ValidateNotNullOrEmpty()]
     [string]
     $CertificateThumbprint
@@ -116,98 +116,158 @@ Param(
 
 PROCESS
 {
+    # Search for the requested code-signing certificate in both the current-user and local-machine certificate stores.
     $certificate = (Get-ChildItem -Path Cert:\CurrentUser\My\ -CodeSigningCert) + (Get-ChildItem -Path Cert:\LocalMachine\My\ -CodeSigningCert) | Where-Object { $_.Thumbprint -eq $CertificateThumbprint }
 
+    # Stop if the requested certificate cannot be found.
     if ($null -eq $certificate)
     {
-        Write-Error "Aucun certificat de signature de code d'empreinte '$($CertificateThumbprint)' n'a été trouvé dans les magasins de certificats utilisateur et machine."
+        Write-Error "No code-signing certificate with thumbprint '$($CertificateThumbprint)' was found in the current-user or local-machine certificate stores."
 
         return
     }
 
-    # Récupération des fichiers PowerShell uniquement dont la taille est supérieure ou égale à 4 octets
+    # Get all PowerShell files that are at least 4 bytes long.
     $files = Get-ChildItem -Path $RootPath -File -Recurse | Where-Object { $_.Extension -imatch '^\.(ps1|psd1|psm1)$' -and $_.Length -ge 4 }
 
+    # Check and sign every existing PowerShell file before starting the file watcher.
     foreach ($file in $files)
     {
         try
         {
-            # Récupération de l'état de la signature
+            # Get the current Authenticode signature status of the file.
             $signature = Get-AuthenticodeSignature -FilePath $file.FullName -ErrorAction Stop
         }
         catch
         {
-            throw "Une erreur est survenue : $($_.Exception.Message)"
+            throw "An error occurred: $($_.Exception.Message)"
         }
 
-        # Signature du fichier PowerShell si le fichier possède une signature non valide
-        # A propos des codes de status des signatures: https://learn.microsoft.com/en-us/dotnet/api/system.management.automation.signaturestatus
-        if ( $signature.Status -ne [System.Management.Automation.SignatureStatus]::Valid)
+        # Sign the file only when its current signature is not valid.
+        # For the available signature status values, see:
+        # https://learn.microsoft.com/en-us/dotnet/api/system.management.automation.signaturestatus
+        if ($signature.Status -ne [System.Management.Automation.SignatureStatus]::Valid)
         {
             Set-AuthenticodeSignature -Certificate $certificate -TimestampServer "http://timestamp.digicert.com" -FilePath $file.FullName
         }
     }
 
+    # Create a file-system watcher for the root directory and its subdirectories.
     $fileSystemWatcher = New-Object System.IO.FileSystemWatcher
     $fileSystemWatcher.Path = Resolve-Path -Path $RootPath | Select-Object -ExpandProperty Path
     $fileSystemWatcher.IncludeSubdirectories = $true
     $fileSystemWatcher.EnableRaisingEvents = $true
     $fileSystemWatcher.NotifyFilter = [System.IO.NotifyFilters]::FileName, [System.IO.NotifyFilters]::LastWrite, [System.IO.NotifyFilters]::Size
 
+    # Shared state passed to the event action:
+    # - Certificate: certificate used to sign files.
+    # - LastProcessed: date and time of the last processed event for each file.
+    # - DebounceMs: minimum delay between two processed events for the same file.
+    $watcherState = @{
+        Certificate   = $certificate
+        LastProcessed = @{}
+        DebounceMs    = 500
+    }
+
+    # Action executed whenever a watched file changes.
     $action = {
         try
         {
-            Write-Host "Événement détecté : $($Event.SourceEventArgs.FullPath)"
+            # Get the full path of the file that triggered the event.
+            $path = $Event.SourceEventArgs.FullPath
+            $now = [DateTime]::UtcNow
 
-            $file = Get-Item -Path $Event.SourceEventArgs.FullPath -ErrorAction Stop
-
-            if ($file.Extension -imatch '^\.(ps1|psd1|psm1)$' -and $file.Length -ge 4)
+            # Debounce rapid events: ignore another event for the same file
+            # if it occurs within the configured debounce delay.
+            if ($Event.MessageData.LastProcessed.ContainsKey($path) -and
+                ($now - $Event.MessageData.LastProcessed[$path]).TotalMilliseconds -lt $Event.MessageData.DebounceMs)
             {
-                # Récupération de l'état de la signature
+                return
+            }
+
+            # Remember when this file was last processed.
+            $Event.MessageData.LastProcessed[$path] = $now
+
+            # Get the file that triggered the event.
+            $file = Get-Item -LiteralPath $path -ErrorAction Stop
+
+            # Process only PowerShell files that are at least 4 bytes long.
+            if ($file.Extension -imatch '^\.(ps1|psd1|psm1)$' -and
+                $file.Length -ge 4)
+            {
+                # Wait until the file stops changing, because an editor such as
+                # VS Code may write a file in several steps.
+                $previousLength = $file.Length
+                $previousLastWriteTime = $file.LastWriteTimeUtc
+
+                for ($attempt = 0; $attempt -lt 10; $attempt++)
+                {
+                    Start-Sleep -Milliseconds 100
+
+                    # Reload the file metadata before comparing it with the previous state.
+                    $file.Refresh()
+
+                    # Stop waiting when both the size and last-write time remain unchanged.
+                    if ($file.Length -eq $previousLength -and
+                        $file.LastWriteTimeUtc -eq $previousLastWriteTime)
+                    {
+                        break
+                    }
+
+                    # Keep the latest file metadata for the next comparison.
+                    $previousLength = $file.Length
+                    $previousLastWriteTime = $file.LastWriteTimeUtc
+                }
+
+                # Check whether the file still has a valid Authenticode signature.
                 $signature = Get-AuthenticodeSignature -FilePath $file.FullName -ErrorAction Stop
 
-                # Signature du fichier PowerShell si le fichier possède une signature non valide
-                # A propos des codes de status des signatures: https://learn.microsoft.com/en-us/dotnet/api/system.management.automation.signaturestatus
-                if ( $signature.Status -ne [System.Management.Automation.SignatureStatus]::Valid)
+                # Resign the file when its content has changed and its signature is no longer valid.
+                if ($signature.Status -ne [System.Management.Automation.SignatureStatus]::Valid)
                 {
-                    Set-AuthenticodeSignature -Certificate $Event.MessageData -TimestampServer "http://timestamp.digicert.com" -FilePath $file.FullName
+                    Set-AuthenticodeSignature -FilePath $file.FullName -Certificate $Event.MessageData.Certificate -TimestampServer "http://timestamp.digicert.com" | Out-Null
+
                 }
             }
         }
         catch
         {
-            Write-Error "Impossible de signer le fichier '$($Event.SourceEventArgs.FullPath)' : $($_.Exception.Message)"
+            # Report the error without stopping the file watcher.
+            Write-Warning "Impossible de signer le fichier '$($Event.SourceEventArgs.FullPath)' : $($_.Exception.Message)"
         }
     }
 
-    Register-ObjectEvent -InputObject $fileSystemWatcher -EventName Changed -Action $action -SourceIdentifier 'PowerShellFileChanged' -MessageData $certificate
+    # Subscribe to file-change events and provide the shared state to the event action.
+    Register-ObjectEvent -InputObject $fileSystemWatcher -EventName Changed -Action $action -SourceIdentifier 'PowerShellFileChanged' -MessageData $watcherState | Out-Null
 
     try
     {
         while ($true)
         {
-            # Suspend l'exécution du script jusqu'à ce qu'un évènement soit déclenché
+            # Keep the script running and wait for the next file-change event.
             Wait-Event -SourceIdentifier 'PowerShellFileChanged' -ErrorAction Stop | Out-Null
         }
     }
     catch
     {
-        Write-Error "Une exception est survenue : $($_.Exception.Message)"
+        Write-Error "An exception occurred: $($_.Exception.Message)"
+
+        return
     }
     finally
     {
+        # Remove the event subscription and release the file-system watcher resources.
         Unregister-Event -SourceIdentifier 'PowerShellFileChanged' -ErrorAction SilentlyContinue
 
         $fileSystemWatcher.Dispose()
     }
-
 }
 
 # SIG # Begin signature block
 # MIIcKAYJKoZIhvcNAQcCoIIcGTCCHBUCAQExCzAJBgUrDgMCGgUAMGkGCisGAQQB
 # gjcCAQSgWzBZMDQGCisGAQQBgjcCAR4wJgIDAQAABBAfzDtgWUsITrck0sYpfvNR
-# AgEAAgEAAgEAAgEAAgEAMCEwCQYFKw4DAhoFAAQUgdaxSDsT6QcjqI/SMwdSByw5
-# giugghZ8MIIDPjCCAiagAwIBAgIQWSl0Rdk7IZ5AP4ehb0/ksDANBgkqhkiG9w0B
+# AgEAAgEAAgEAAgEAAgEAMCEwCQYFKw4DAhoFAAQUjMRtyEVv8iaQIoGE/Zgpylem
+# WKGgghZ8MIIDPjCCAiagAwIBAgIQWSl0Rdk7IZ5AP4ehb0/ksDANBgkqhkiG9w0B
 # AQsFADA3MTUwMwYDVQQDDCxDaHJpc3RvcGhlciBHRVJBUkQgLSBQb3dlclNoZWxs
 # IENvZGUgU2lnbmluZzAeFw0yNjExMDcwMDUxNDJaFw0zNjExMDcwMTAxNDJaMDcx
 # NTAzBgNVBAMMLENocmlzdG9waGVyIEdFUkFSRCAtIFBvd2VyU2hlbGwgQ29kZSBT
@@ -331,28 +391,28 @@ PROCESS
 # IFBvd2VyU2hlbGwgQ29kZSBTaWduaW5nAhBZKXRF2TshnkA/h6FvT+SwMAkGBSsO
 # AwIaBQCgeDAYBgorBgEEAYI3AgEMMQowCKACgAChAoAAMBkGCSqGSIb3DQEJAzEM
 # BgorBgEEAYI3AgEEMBwGCisGAQQBgjcCAQsxDjAMBgorBgEEAYI3AgEVMCMGCSqG
-# SIb3DQEJBDEWBBR3CX2IMOz6qj/kooE7jb+5nwmVxzANBgkqhkiG9w0BAQEFAASC
-# AQA2LG/T1mPX1o80XtzTwGXiBn/yTPBHj3FbrZ5oZsWEqK8rBLWu/Q+HK9DtXnv7
-# jKlvuJJQs4vuaiGAYsD8NWT2iNQE+DCntRF6VbgO6Ty02LtYxKkaYs9799ce0yVz
-# KaiF7fBgxDyqjCfcZ+DkWtBvkkA0C3gSiBuNcuQTSQFaWF1ABOgxCO3RT138YWhq
-# cEjYMTtk3+OG0GyVytaYVd9H6lINUjRBtQrMsNw8KFUzhYPL4GyUMy0gkJgVM8sn
-# vyJysLM3nXzLMMibfZ1e3/7EzIqyaZsAE26vWwWk6g81Pfg9osSQSGJkdsCN0JsF
-# HrrDCBc5R5HP/Fp2UHx+vZP2oYIDJjCCAyIGCSqGSIb3DQEJBjGCAxMwggMPAgEB
+# SIb3DQEJBDEWBBQq+dF0Ps4JYSaw3KYUDEVgUvVcYTANBgkqhkiG9w0BAQEFAASC
+# AQCzsz6zKZeEv/jeZOW0ujarn6Tbud6QJoc/K4+zuqx1RHzNwwsOqe3DnzDCu3dc
+# Ei35+8hhDEAriW7p5eKXEvzLxFlZwiAKWOQP34R1eyKw68KcxmGXwO0zeeHqz+89
+# g998rpnx8nWLSpebH1elOVNx97MCRIw8mi0Qt1XEgl3g82SInRg1vNKlUehii/9M
+# mfOOFoe/G9Nvbgv3KrtiqDhi7FyGNsGUsthW8aluY25gxJf9yluR8GBWw6Kp5xsP
+# Hu0ZSBmOGU+Yc/RKi64AyL6ax+W/+uQDt5879hMb3oZNwmUkrueKfRDFl6BqBXjB
+# /t/hBs2StU1GVFV5NA3C5RinoYIDJjCCAyIGCSqGSIb3DQEJBjGCAxMwggMPAgEB
 # MH0waTELMAkGA1UEBhMCVVMxFzAVBgNVBAoTDkRpZ2lDZXJ0LCBJbmMuMUEwPwYD
 # VQQDEzhEaWdpQ2VydCBUcnVzdGVkIEc0IFRpbWVTdGFtcGluZyBSU0E0MDk2IFNI
 # QTI1NiAyMDI1IENBMQIQCE/cM09+RU7bww+P+ZIYNTANBglghkgBZQMEAgEFAKBp
-# MBgGCSqGSIb3DQEJAzELBgkqhkiG9w0BBwEwHAYJKoZIhvcNAQkFMQ8XDTI2MTEw
-# NzAyMDYyN1owLwYJKoZIhvcNAQkEMSIEIGhfEkMZgDmzjRwGJGtcw0CSy0f50X45
-# Lzswbt7PWBPOMA0GCSqGSIb3DQEBAQUABIICAI47S4DNKZgGqSqYmVOxxnN4JYVD
-# 91vhypn8La3/gMciBQsGvfnIsOVJUfx6YHbS7T/YgY6VGtdFhzkqM1rKA1ONqb19
-# B1vDvkt3CG7LhpXmPpzmuY+MRqqFoiYi8KXjWWXvmARmFIeOW/qT64Xg06YsnWhb
-# c9Fs+Xpy4Upd+9wDtZoV+VNi1OKUA3Fg2nSAMGtAbyWJb4JvzM8ErA8VM7cgqrBX
-# McU+laRWoikA1CdnGuR6gkC/rAYjyPMwgPK6gISbkvYUx7V1sUFE5jifIEVHIx1G
-# LPDOAZF27sxv09y4BNf7qIJE6IW3uDj7gwTrzmKdrb/4Csm/41HEEH6hqnPi803D
-# dmEL8nqpBSihIQUYcchRHRizKX+SrbXfIyb+DpegVK/vtLRdbKbujQr/RGw7H2gG
-# ZW9/y40xjaaJ1HxLYLZUeK17f8cPvI3xfU3ftonlDZ5Umqu1jKUDJ8f3dVXzpdN/
-# FZCjLuozM22KMCXrG19ELiwI9CMa8mUADA3F6Xb+JBB8MU02+UMYnardLeYq2BeS
-# lmzQfvKAOQjq2YdqQDNnGklOsXc6i5LaIOPMumetCC7iFYbFbUf2lup2t5Vn/Kkj
-# DAty/oICOwk4SZfQ4O8MAyeA0x9uDBJIRESSme7C4KRh8WX8JSIDs2BHAXU0fO8N
-# Ysdv8Mmq6JSfnajn
+# MBgGCSqGSIb3DQEJAzELBgkqhkiG9w0BBwEwHAYJKoZIhvcNAQkFMQ8XDTI2MTEx
+# MjE5MjU0MlowLwYJKoZIhvcNAQkEMSIEIK3hPkxfYLE6d9EkwFPl9zyOxuq6ekHD
+# MwrKwZLyISn9MA0GCSqGSIb3DQEBAQUABIICAF+DX6Hfo75l0irUW+ZgtRVpDEJl
+# aimZD6nNBISSb9Hnw5C4U2ahHiJg3CKtAK7WfGXcm9qKWpzLtd9FRwB7/+TbesIj
+# bF5snFO76dULJhDiVlnaqeWmM40Ta9wpUs0E2j4cMf2e/l+0JoZbNcibBydcYnXp
+# doRZUwz8q2tk4wVd5Iz5LZuKDx61t42juaXxLxyHFxFBK2XppruV2l7QdnfYqiRT
+# Mh467mKGIdSfc7AOd82kd5qVKlKtVh5xYJ3gRqi9svHFGBnA6xBdnRm5q4oXCZOq
+# Xc29GVIAqtvJoyJVVUVznVYCjngts/OcsNpAIUSUhsIyUgN4o0j7AiRIQoDiv+Jm
+# K+TfXMuacgt6SQUiMEp9r2+8mjWAA/iV4vSo4eKJg1mRLB9f1A7FCz7LASLQCQLB
+# ZYezG/JNTYd14hptKNJINi/2AzwzWp2kwLcKjch927zALhtuM6tIAgGakWZuk0RE
+# p6bjwb8n62NbHzRK8zfE1mTxjMkDfe+zo/1b2cvFlKi8e9mimVWj1Ge+PuPB/ZEv
+# mBzEM3hyssPtcqiLrbkO+YqzJRw4NqZp/0Bcqc9Ya5BV3LxOqJ4mbxk7o4OFr3Hp
+# 8IoDLbR0haESYJyPpzoVdy5OVBMaxdQfgDlext/F4sqrcZPSLU6kwH8Zy6FNAiwj
+# dzaXQlowsd83tX2K
 # SIG # End signature block
